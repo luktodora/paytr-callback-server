@@ -19,16 +19,22 @@ app.get("/", (req, res) => {
     status: "OK",
     message: "PayTR Callback Server is running",
     timestamp: new Date().toISOString(),
-    version: "7.0.0",
+    version: "8.0.0",
   })
 })
 
 // Health check endpoint
 app.get("/health", (req, res) => {
+  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
   res.json({
     status: "healthy",
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
+    baseUrl: baseUrl,
+    env: {
+      MERCHANT_KEY: process.env.PAYTR_MERCHANT_KEY ? "SET" : "MISSING",
+      MERCHANT_SALT: process.env.PAYTR_MERCHANT_SALT ? "SET" : "MISSING",
+    },
   })
 })
 
@@ -168,6 +174,7 @@ app.get("/paytr-callback", (req, res) => {
   console.log("Query:", JSON.stringify(req.query, null, 2))
   console.log("URL:", req.url)
   console.log("Original URL:", req.originalUrl)
+  console.log("Headers:", JSON.stringify(req.headers, null, 2))
 
   const { merchant_oid, status, total_amount } = req.query
   const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
@@ -238,7 +245,7 @@ app.all("/debug", (req, res) => {
     body: req.body,
     headers: req.headers,
     timestamp: new Date().toISOString(),
-    lastSuccessfulPayment: lastSuccessfulPayments,
+    lastSuccessfulPayment: Array.from(lastSuccessfulPayments.entries()),
     env: {
       PORT: process.env.PORT,
       BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
@@ -263,6 +270,25 @@ app.get("/test-fail", (req, res) => {
   res.redirect(`${baseUrl}/odeme/basarisiz?siparis=TEST123&status=failed`)
 })
 
+// PayTR'nin doğrudan yönlendirme yapacağı endpoint
+app.get("/direct-callback", (req, res) => {
+  console.log("=== DIRECT CALLBACK RECEIVED ===")
+  console.log("Query:", JSON.stringify(req.query, null, 2))
+
+  const { merchant_oid, status } = req.query
+  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
+
+  if (status === "success") {
+    const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${merchant_oid || "UNKNOWN"}`
+    console.log(`✅ Direct redirecting to success: ${redirectUrl}`)
+    res.redirect(redirectUrl)
+  } else {
+    const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=${merchant_oid || "UNKNOWN"}`
+    console.log(`❌ Direct redirecting to fail: ${redirectUrl}`)
+    res.redirect(redirectUrl)
+  }
+})
+
 // Server'ı başlat
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 PayTR Callback Server running on port ${PORT}`)
@@ -271,6 +297,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`💚 Health Check: https://paytr-callback-server-production.up.railway.app/health`)
   console.log(`🧪 Test Success: https://paytr-callback-server-production.up.railway.app/test-success`)
   console.log(`🧪 Test Fail: https://paytr-callback-server-production.up.railway.app/test-fail`)
+  console.log(`🔄 Direct Callback: https://paytr-callback-server-production.up.railway.app/direct-callback`)
 
   const merchant_key = process.env.PAYTR_MERCHANT_KEY
   let merchant_salt = process.env.PAYTR_MERCHANT_SALT
