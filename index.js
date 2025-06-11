@@ -2,14 +2,13 @@ const express = require("express")
 const crypto = require("crypto")
 
 const app = express()
-// Railway otomatik olarak PORT'u ayarlar, yoksa 3000 kullan
 const PORT = process.env.PORT || 3000
 
 // Middleware
 app.use(express.urlencoded({ extended: true }))
 app.use(express.json())
 
-// CORS headers ekle
+// CORS headers
 app.use((req, res, next) => {
   res.header("Access-Control-Allow-Origin", "*")
   res.header("Access-Control-Allow-Methods", "GET,PUT,POST,DELETE,OPTIONS")
@@ -17,113 +16,104 @@ app.use((req, res, next) => {
   next()
 })
 
-// PayTR callback endpoint
-app.post("/paytr-callback", async (req, res) => {
+// PayTR callback endpoint - Hem POST hem GET isteklerini karşılar
+app.all("/paytr-callback", async (req, res) => {
   try {
     console.log("=== PayTR CALLBACK RECEIVED ===")
+    console.log("Method:", req.method)
     console.log("Headers:", req.headers)
     console.log("Body:", req.body)
+    console.log("Query:", req.query)
 
-    const { merchant_oid, status, total_amount, hash } = req.body
-
-    // Vercel uygulamanızın URL'si
     const VERCEL_APP_URL = "https://mapsyorum.com.tr"
 
-    if (!merchant_oid || !status || !total_amount || !hash) {
-      console.error("Missing required fields")
+    // POST request (PayTR backend notification)
+    if (req.method === "POST") {
+      const { merchant_oid, status, total_amount, hash } = req.body
+
+      if (!merchant_oid || !status || !total_amount || !hash) {
+        console.error("Missing required fields in POST")
+        return res.status(200).send("OK")
+      }
+
+      // Hash doğrulama
+      const merchant_key = process.env.PAYTR_MERCHANT_KEY
+      const merchant_salt = process.env.PAYTR_MERCHANT_SALT
+
+      console.log("Environment check:", {
+        hasKey: !!merchant_key,
+        hasSalt: !!merchant_salt,
+      })
+
+      if (merchant_key && merchant_salt) {
+        const hash_str = `${merchant_oid}${merchant_salt}${status}${total_amount}`
+        const calculated_hash = crypto.createHmac("sha256", merchant_key).update(hash_str).digest("base64")
+
+        console.log("Hash verification:", {
+          received: hash,
+          calculated: calculated_hash,
+          match: hash === calculated_hash,
+        })
+
+        if (hash === calculated_hash) {
+          // Vercel uygulamanıza bildirim gönder
+          try {
+            const fetch = (await import("node-fetch")).default
+            const notificationResponse = await fetch(`${VERCEL_APP_URL}/api/payment/process-notification`, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                merchant_oid,
+                status,
+                total_amount,
+                verified: true,
+              }),
+            })
+
+            if (notificationResponse.ok) {
+              console.log("✅ Notification sent to Vercel app successfully")
+            } else {
+              console.error("❌ Failed to send notification to Vercel app")
+            }
+          } catch (error) {
+            console.error("Error sending notification to Vercel:", error)
+          }
+        }
+      }
+
       return res.status(200).send("OK")
     }
 
-    // Hash doğrulama
-    const merchant_key = process.env.PAYTR_MERCHANT_KEY
-    const merchant_salt = process.env.PAYTR_MERCHANT_SALT
+    // GET request (User redirect from PayTR)
+    if (req.method === "GET") {
+      console.log("🔄 GET request - User redirect detected")
 
-    console.log("Environment check:", {
-      hasKey: !!merchant_key,
-      hasSalt: !!merchant_salt,
-      keyLength: merchant_key ? merchant_key.length : 0,
-    })
+      const { merchant_oid, status, total_amount } = req.query
 
-    if (merchant_key && merchant_salt) {
-      const hash_str = `${merchant_oid}${merchant_salt}${status}${total_amount}`
-      const calculated_hash = crypto.createHmac("sha256", merchant_key).update(hash_str).digest("base64")
-
-      console.log("Hash verification:", {
-        received: hash,
-        calculated: calculated_hash,
-        match: hash === calculated_hash,
-      })
-
-      if (hash === calculated_hash) {
-        // Hash doğru - Vercel uygulamanıza bildirim gönder
-        try {
-          const fetch = (await import("node-fetch")).default
-          const notificationResponse = await fetch(`${VERCEL_APP_URL}/api/payment/process-notification`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              merchant_oid,
-              status,
-              total_amount,
-              verified: true,
-            }),
-          })
-
-          if (notificationResponse.ok) {
-            console.log("✅ Notification sent to Vercel app successfully")
-          } else {
-            console.error("❌ Failed to send notification to Vercel app:", await notificationResponse.text())
-          }
-        } catch (error) {
-          console.error("Error sending notification to Vercel:", error)
-        }
-
-        // Kullanıcı yönlendirmesi (eğer bu bir browser request'iyse)
-        const userAgent = req.headers["user-agent"] || ""
-        const isFromBrowser =
-          userAgent.includes("Mozilla") || userAgent.includes("Chrome") || userAgent.includes("Safari")
-
-        if (isFromBrowser) {
-          console.log("🔄 Browser request detected - redirecting user")
-
-          if (status === "success") {
-            const amount_tl = Math.round(Number.parseInt(total_amount) / 100)
-            return res.redirect(
-              `${VERCEL_APP_URL}/odeme/basarili?siparis=${merchant_oid}&amount=${amount_tl}&status=success`,
-            )
-          } else {
-            return res.redirect(`${VERCEL_APP_URL}/odeme/basarisiz?siparis=${merchant_oid}&status=failed`)
-          }
-        }
-      } else {
-        console.error("❌ Hash verification failed")
+      if (!merchant_oid) {
+        console.error("No merchant_oid in GET request")
+        return res.redirect(`${VERCEL_APP_URL}/odeme/basarisiz?siparis=UNKNOWN&status=failed`)
       }
-    } else {
-      console.error("❌ Missing PayTR credentials")
+
+      if (status === "success" || status === "1") {
+        const amount_tl = total_amount ? Math.round(Number.parseInt(total_amount) / 100) : 0
+        console.log(`✅ Redirecting to success page: ${merchant_oid}, amount: ${amount_tl}`)
+        return res.redirect(
+          `${VERCEL_APP_URL}/odeme/basarili?siparis=${merchant_oid}&amount=${amount_tl}&status=success`,
+        )
+      } else {
+        console.log(`❌ Redirecting to failure page: ${merchant_oid}`)
+        return res.redirect(`${VERCEL_APP_URL}/odeme/basarisiz?siparis=${merchant_oid}&status=failed`)
+      }
     }
 
-    // PayTR'ye OK yanıtı döndür
+    // Diğer HTTP methodları
     res.status(200).send("OK")
   } catch (error) {
     console.error("Callback error:", error)
     res.status(200).send("OK")
-  }
-})
-
-// GET istekleri için yönlendirme
-app.get("/paytr-callback", (req, res) => {
-  console.log("=== PayTR GET CALLBACK ===")
-  console.log("Query params:", req.query)
-
-  const VERCEL_APP_URL = "https://mapsyorum.com.tr"
-  const { merchant_oid, status, amount } = req.query
-
-  if (status === "success" || status === "1") {
-    res.redirect(`${VERCEL_APP_URL}/odeme/basarili?siparis=${merchant_oid}&amount=${amount}&status=success`)
-  } else {
-    res.redirect(`${VERCEL_APP_URL}/odeme/basarisiz?siparis=${merchant_oid}&status=failed`)
   }
 })
 
