@@ -32,8 +32,8 @@ app.get("/health", (req, res) => {
   })
 })
 
-// Global değişken - son başarılı ödeme bilgilerini sakla
-let lastSuccessfulPayment = null
+// Global değişken - son başarılı ödeme bilgilerini sakla (5 dakika boyunca)
+const lastSuccessfulPayments = new Map()
 
 // PayTR callback endpoint - POST
 app.post("/paytr-callback", async (req, res) => {
@@ -104,14 +104,16 @@ app.post("/paytr-callback", async (req, res) => {
 
     console.log("✅ Hash verification SUCCESS or bypassed")
 
-    // Son başarılı ödeme bilgilerini sakla
+    // Son başarılı ödeme bilgilerini sakla (5 dakika boyunca)
     if (status === "success") {
-      lastSuccessfulPayment = {
+      const paymentData = {
         merchant_oid,
         total_amount,
         timestamp: new Date().toISOString(),
+        expiresAt: Date.now() + 5 * 60 * 1000, // 5 dakika
       }
-      console.log("💾 Saved last successful payment:", lastSuccessfulPayment)
+      lastSuccessfulPayments.set(merchant_oid, paymentData)
+      console.log("💾 Saved last successful payment:", paymentData)
     }
 
     // Ana uygulamaya bildirim gönder
@@ -172,18 +174,36 @@ app.get("/paytr-callback", (req, res) => {
 
   console.log("GET callback values:", { merchant_oid, status, total_amount })
 
-  // Eğer query parametreleri boşsa ve son başarılı ödeme varsa onu kullan
-  if (!merchant_oid && !status && lastSuccessfulPayment) {
-    console.log("🔄 Using last successful payment data:", lastSuccessfulPayment)
+  // Eğer query parametreleri boşsa, son başarılı ödemeleri kontrol et
+  if (!merchant_oid && !status) {
+    console.log("🔍 Checking saved payments...")
 
-    const amount_tl = Math.round(Number.parseInt(lastSuccessfulPayment.total_amount) / 100)
-    const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${lastSuccessfulPayment.merchant_oid}&amount=${amount_tl}`
-    console.log(`✅ Redirecting to success with saved data: ${redirectUrl}`)
+    // Süresi dolmuş ödemeleri temizle
+    const now = Date.now()
+    for (const [key, payment] of lastSuccessfulPayments.entries()) {
+      if (payment.expiresAt < now) {
+        lastSuccessfulPayments.delete(key)
+        console.log("🗑️ Removed expired payment:", key)
+      }
+    }
 
-    // Kullanıldıktan sonra temizle
-    lastSuccessfulPayment = null
+    // En son başarılı ödemeyi bul
+    let latestPayment = null
+    for (const payment of lastSuccessfulPayments.values()) {
+      if (!latestPayment || new Date(payment.timestamp) > new Date(latestPayment.timestamp)) {
+        latestPayment = payment
+      }
+    }
 
-    return res.redirect(redirectUrl)
+    if (latestPayment) {
+      console.log("🔄 Using latest successful payment data:", latestPayment)
+
+      const amount_tl = Math.round(Number.parseInt(latestPayment.total_amount) / 100)
+      const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${latestPayment.merchant_oid}&amount=${amount_tl}`
+      console.log(`✅ Redirecting to success with saved data: ${redirectUrl}`)
+
+      return res.redirect(redirectUrl)
+    }
   }
 
   // Normal query parametreleri varsa onları kullan
@@ -218,7 +238,7 @@ app.all("/debug", (req, res) => {
     body: req.body,
     headers: req.headers,
     timestamp: new Date().toISOString(),
-    lastSuccessfulPayment: lastSuccessfulPayment,
+    lastSuccessfulPayment: lastSuccessfulPayments,
     env: {
       PORT: process.env.PORT,
       BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
