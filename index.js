@@ -26,7 +26,7 @@ app.get("/", (req, res) => {
     status: "OK",
     message: "PayTR Callback Server is running",
     timestamp: new Date().toISOString(),
-    version: "3.0.0",
+    version: "4.0.0",
   })
 })
 
@@ -54,17 +54,22 @@ app.post("/paytr-callback", async (req, res) => {
       merchant_oid,
       status,
       total_amount,
-      hash: hash ? "***" : "missing",
+      hash: hash ? hash.substring(0, 10) + "..." : "missing",
     })
 
-    if (!merchant_oid || !status || !total_amount || !hash) {
+    if (!merchant_oid || !status || total_amount === undefined || !hash) {
       console.error("❌ Missing required fields in callback")
       return res.status(400).send("MISSING_PARAMS")
     }
 
-    // Hash doğrulama - PayTR callback için doğru algoritma
+    // Environment variables kontrolü
     const merchant_key = process.env.PAYTR_MERCHANT_KEY
     const merchant_salt = process.env.PAYTR_MERCHANT_SALT
+
+    console.log("Environment check:", {
+      merchant_key: merchant_key ? merchant_key.substring(0, 5) + "***" : "MISSING",
+      merchant_salt: merchant_salt ? merchant_salt.substring(0, 5) + "***" : "MISSING",
+    })
 
     if (!merchant_key || !merchant_salt) {
       console.error("❌ PayTR credentials missing")
@@ -75,14 +80,16 @@ app.post("/paytr-callback", async (req, res) => {
     const hash_str = `${merchant_oid}${merchant_salt}${status}${total_amount}`
     const calculated_hash = crypto.createHmac("sha256", merchant_key).update(hash_str).digest("base64")
 
-    console.log("Hash verification:", {
-      merchant_oid,
-      merchant_salt: merchant_salt.substring(0, 5) + "***",
-      status,
-      total_amount,
-      hash_str,
-      received_hash: hash.substring(0, 10) + "...",
+    console.log("Hash calculation details:", {
+      merchant_oid: merchant_oid,
+      merchant_salt: merchant_salt,
+      status: status,
+      total_amount: total_amount,
+      hash_string: hash_str,
       calculated_hash: calculated_hash.substring(0, 10) + "...",
+      received_hash: hash.substring(0, 10) + "...",
+      full_calculated: calculated_hash,
+      full_received: hash,
       match: hash === calculated_hash,
     })
 
@@ -90,7 +97,7 @@ app.post("/paytr-callback", async (req, res) => {
       console.error("❌ Hash verification FAILED")
       console.error("Expected hash:", calculated_hash)
       console.error("Received hash:", hash)
-      console.error("Hash string:", hash_str)
+      console.error("Hash string used:", hash_str)
       return res.status(400).send("HASH_MISMATCH")
     }
 
@@ -178,8 +185,10 @@ app.all("/debug", (req, res) => {
     env: {
       PORT: process.env.PORT,
       BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
-      HAS_MERCHANT_KEY: !!process.env.PAYTR_MERCHANT_KEY,
-      HAS_MERCHANT_SALT: !!process.env.PAYTR_MERCHANT_SALT,
+      MERCHANT_KEY: process.env.PAYTR_MERCHANT_KEY ? process.env.PAYTR_MERCHANT_KEY.substring(0, 5) + "***" : "MISSING",
+      MERCHANT_SALT: process.env.PAYTR_MERCHANT_SALT
+        ? process.env.PAYTR_MERCHANT_SALT.substring(0, 5) + "***"
+        : "MISSING",
     },
   })
 })
@@ -198,10 +207,18 @@ app.post("/test-hash", (req, res) => {
   const calculated_hash = crypto.createHmac("sha256", merchant_key).update(hash_str).digest("base64")
 
   res.json({
+    merchant_oid,
+    merchant_salt,
+    status,
+    total_amount,
     hash_str,
     calculated_hash,
     received_hash: hash,
     match: hash === calculated_hash,
+    env_check: {
+      merchant_key: merchant_key ? "SET" : "MISSING",
+      merchant_salt: merchant_salt ? "SET" : "MISSING",
+    },
   })
 })
 
@@ -229,7 +246,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`🔐 Test Hash: https://paytr-callback-server-production.up.railway.app/test-hash`)
   console.log(`⚙️  Environment:`, {
     BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
-    HAS_MERCHANT_KEY: !!process.env.PAYTR_MERCHANT_KEY,
-    HAS_MERCHANT_SALT: !!process.env.PAYTR_MERCHANT_SALT,
+    MERCHANT_KEY: process.env.PAYTR_MERCHANT_KEY ? "SET" : "MISSING",
+    MERCHANT_SALT: process.env.PAYTR_MERCHANT_SALT ? "SET" : "MISSING",
   })
 })
