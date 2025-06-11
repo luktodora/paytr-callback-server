@@ -1,193 +1,136 @@
 const express = require("express")
+const bodyParser = require("body-parser")
 const crypto = require("crypto")
+const fetch = require("node-fetch")
+const cors = require("cors")
 
 const app = express()
 const PORT = process.env.PORT || 3000
 
-// Middleware
-app.use(express.urlencoded({ extended: true }))
-app.use(express.json())
+// CORS ayarları
+app.use(cors())
 
-// PayTR callback endpoint - Hem backend hem frontend istekleri
-app.all("/paytr-callback", async (req, res) => {
+// Body parser middleware
+app.use(bodyParser.urlencoded({ extended: true }))
+app.use(bodyParser.json())
+
+// Ana sayfa
+app.get("/", (req, res) => {
+  res.send("PayTR Callback Server is running")
+})
+
+// PayTR callback endpoint
+app.post("/paytr-callback", async (req, res) => {
+  console.log("=== PAYTR CALLBACK RECEIVED ===")
+  console.log("Timestamp:", new Date().toISOString())
+  console.log("Headers:", req.headers)
+  console.log("Body:", req.body)
+
   try {
-    console.log("=== PayTR CALLBACK RECEIVED ===")
-    console.log("Method:", req.method)
-    console.log("Timestamp:", new Date().toISOString())
-    console.log("User-Agent:", req.headers["user-agent"])
-    console.log("Headers:", JSON.stringify(req.headers, null, 2))
+    // PayTR'den gelen veriler
+    const { merchant_oid, status, total_amount, hash } = req.body
 
-    const VERCEL_APP_URL = "https://mapsyorum.com.tr"
+    if (!merchant_oid || !status || !total_amount || !hash) {
+      console.error("Missing required fields in callback")
+      return res.status(400).send("MISSING_PARAMS")
+    }
 
-    // User-Agent kontrolü - Browser'dan mı geliyor?
-    const userAgent = req.headers["user-agent"] || ""
-    const isFromBrowser =
-      userAgent.includes("Mozilla") ||
-      userAgent.includes("Chrome") ||
-      userAgent.includes("Safari") ||
-      userAgent.includes("Edge") ||
-      userAgent.includes("Firefox")
+    // Hash doğrulama
+    const merchant_key = process.env.PAYTR_MERCHANT_KEY
+    const merchant_salt = process.env.PAYTR_MERCHANT_SALT
 
-    console.log("REQUEST TYPE:", {
-      userAgent: userAgent.substring(0, 50) + "...",
-      isFromBrowser,
-      method: req.method,
+    if (!merchant_key || !merchant_salt) {
+      console.error("PayTR credentials missing")
+      return res.status(500).send("CONFIG_ERROR")
+    }
+
+    const hash_str = `${merchant_oid}${merchant_salt}${status}${total_amount}`
+    const calculated_hash = crypto.createHmac("sha256", merchant_key).update(hash_str).digest("base64")
+
+    console.log("Hash verification:", {
+      received_hash: hash,
+      calculated_hash,
+      match: hash === calculated_hash,
     })
 
-    // GET request veya Browser'dan gelen POST (Kullanıcı yönlendirmesi)
-    if (req.method === "GET" || isFromBrowser) {
-      console.log("🌐 USER REDIRECT REQUEST")
-
-      let merchant_oid, status, total_amount, payment_amount
-
-      if (req.method === "GET") {
-        // GET parametrelerinden al
-        ;({ merchant_oid, status, total_amount, payment_amount } = req.query)
-        console.log("GET Parameters:", req.query)
-      } else {
-        // POST body'sinden al
-        ;({ merchant_oid, status, total_amount, payment_amount } = req.body)
-        console.log("POST Body for user redirect:", req.body)
-      }
-
-      // Başarılı ödeme kontrolü
-      const isSuccess = status === "success" || status === "1"
-
-      if (isSuccess && merchant_oid) {
-        const amount_tl = Math.round(Number.parseInt(total_amount || payment_amount || "0") / 100)
-        console.log(`✅ Redirecting user to SUCCESS page: ${merchant_oid}, amount: ${amount_tl}`)
-        return res.redirect(
-          `${VERCEL_APP_URL}/odeme/basarili?siparis=${merchant_oid}&amount=${amount_tl}&status=success`,
-        )
-      } else if (merchant_oid) {
-        console.log(`❌ Redirecting user to FAILURE page: ${merchant_oid}`)
-        return res.redirect(`${VERCEL_APP_URL}/odeme/basarisiz?siparis=${merchant_oid}&status=failed`)
-      } else {
-        console.log("⚠️ No merchant_oid, redirecting to generic failure")
-        return res.redirect(`${VERCEL_APP_URL}/odeme/basarisiz?siparis=UNKNOWN&status=failed`)
-      }
+    if (hash !== calculated_hash) {
+      console.error("❌ Hash verification FAILED")
+      return res.status(400).send("HASH_MISMATCH")
     }
 
-    // POST request from PayTR server (Backend bildirim)
-    if (req.method === "POST" && !isFromBrowser) {
-      console.log("📨 BACKEND NOTIFICATION from PayTR")
-      console.log("RAW BODY:", JSON.stringify(req.body, null, 2))
+    // Sipariş durumunu işle
+    if (status === "success") {
+      console.log(`✅ Payment SUCCESS for order: ${merchant_oid}`)
+      console.log(`💰 Amount: ${total_amount} kuruş`)
 
-      const { merchant_oid, status, total_amount, hash, merchant_id, payment_amount } = req.body
+      // Ana uygulamaya bildirim gönder
+      const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
 
-      console.log("PAYMENT DATA:", {
-        merchant_oid,
-        status,
-        total_amount,
-        payment_amount,
-        merchant_id,
-      })
+      try {
+        // Siparişi tamamla
+        const completeOrderResponse = await fetch(`${baseUrl}/api/orders`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            orderNumber: merchant_oid,
+            amount: Math.round(Number.parseInt(total_amount) / 100), // Kuruştan TL'ye çevir
+            status: "completed",
+            paymentMethod: "paytr",
+          }),
+        })
 
-      // Merchant OID kontrolü
-      if (!merchant_oid) {
-        console.error("❌ No merchant_oid in backend notification")
-        return res.status(200).send("OK")
-      }
-
-      // PayTR'nin status'una güven
-      const isPaymentSuccessful = status === "success" || status === "1"
-
-      console.log("BACKEND PROCESSING:", {
-        status,
-        isPaymentSuccessful,
-        action: isPaymentSuccessful ? "NOTIFY_VERCEL_SUCCESS" : "NOTIFY_VERCEL_FAILURE",
-      })
-
-      if (isPaymentSuccessful) {
-        console.log("💰 Processing backend notification for successful payment...")
-
-        // Vercel uygulamanıza bildirim gönder
-        try {
-          const fetch = (await import("node-fetch")).default
-          const notificationResponse = await fetch(`${VERCEL_APP_URL}/api/payment/process-notification`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              merchant_oid,
-              status: "success",
-              total_amount,
-              payment_amount,
-              verified: true,
-              hash_match: true,
-              is_successful: true,
-              raw_data: req.body,
-              processed_at: new Date().toISOString(),
-              bypass_hash: true,
-            }),
-          })
-
-          const responseText = await notificationResponse.text()
-          console.log("✅ Vercel notification sent:", responseText)
-        } catch (error) {
-          console.error("❌ Error sending notification to Vercel:", error)
+        if (completeOrderResponse.ok) {
+          console.log("✅ Order completed successfully")
+        } else {
+          console.error("❌ Failed to complete order")
         }
+
+        // Kullanıcıyı başarılı sayfasına yönlendir
+        console.log(
+          `✅ Redirecting to success page: ${baseUrl}/odeme/basarili?siparis=${merchant_oid}&amount=${total_amount}`,
+        )
+
+        // PayTR'ye OK yanıtı döndür
+        return res.send("OK")
+      } catch (error) {
+        console.error("Error processing order:", error)
+        return res.send("OK") // Yine de OK döndür
       }
+    } else {
+      console.log(`❌ Payment FAILED for order: ${merchant_oid}`)
 
-      return res.status(200).send("OK")
+      // Kullanıcıyı başarısız sayfasına yönlendir
+      const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
+      console.log(`❌ Redirecting to fail page: ${baseUrl}/odeme/basarisiz?siparis=${merchant_oid}&status=failed`)
+
+      // PayTR'ye OK yanıtı döndür
+      return res.send("OK")
     }
-
-    // Fallback
-    console.log("⚠️ Unhandled request type")
-    res.status(200).send("OK")
   } catch (error) {
-    console.error("❌ Callback error:", error)
-    res.status(500).send("ERROR")
+    console.error("Callback error:", error)
+    // Hata durumunda bile OK döndür
+    return res.send("OK")
   }
 })
 
-// Manuel test endpoint'leri
-app.get("/test-success/:orderNumber", (req, res) => {
-  const VERCEL_APP_URL = "https://mapsyorum.com.tr"
-  const orderNumber = req.params.orderNumber
-  const amount = req.query.amount || 299
+// GET istekleri için de aynı endpoint
+app.get("/paytr-callback", (req, res) => {
+  console.log("=== PAYTR CALLBACK GET ===")
+  console.log("Query:", req.query)
 
-  console.log(`🧪 TEST SUCCESS: ${orderNumber}, amount: ${amount}`)
-  res.redirect(`${VERCEL_APP_URL}/odeme/basarili?siparis=${orderNumber}&amount=${amount}&status=success`)
+  const { merchant_oid, status } = req.query
+  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
+
+  if (status === "success") {
+    res.redirect(`${baseUrl}/odeme/basarili?siparis=${merchant_oid || "UNKNOWN"}`)
+  } else {
+    res.redirect(`${baseUrl}/odeme/basarisiz?siparis=${merchant_oid || "UNKNOWN"}&status=${status || "failed"}`)
+  }
 })
 
-app.get("/test-fail/:orderNumber", (req, res) => {
-  const VERCEL_APP_URL = "https://mapsyorum.com.tr"
-  const orderNumber = req.params.orderNumber
-
-  console.log(`🧪 TEST FAIL: ${orderNumber}`)
-  res.redirect(`${VERCEL_APP_URL}/odeme/basarisiz?siparis=${orderNumber}&status=failed`)
-})
-
-// Health check
-app.get("/health", (req, res) => {
-  res.json({
-    status: "OK",
-    timestamp: new Date().toISOString(),
-    port: PORT,
-    message: "PayTR Proxy with User-Agent detection",
-  })
-})
-
-// Test endpoint
-app.get("/test", (req, res) => {
-  res.json({
-    message: "Railway PayTR Proxy is working",
-    timestamp: new Date().toISOString(),
-    endpoints: {
-      callback: "/paytr-callback (handles both user and backend)",
-      test_success: "/test-success/ORDER_NUMBER?amount=AMOUNT",
-      test_fail: "/test-fail/ORDER_NUMBER",
-      health: "/health",
-    },
-  })
-})
-
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Railway PayTR Proxy Server running on port ${PORT}`)
-  console.log(`🔗 Callback URL: https://paytr-callback-server-production.up.railway.app/paytr-callback`)
-  console.log(`🧪 Test Success: https://paytr-callback-server-production.up.railway.app/test-success/ORDER_NUMBER`)
-  console.log(`🧪 Test Fail: https://paytr-callback-server-production.up.railway.app/test-fail/ORDER_NUMBER`)
-  console.log(`⚡ Smart routing: User-Agent detection enabled`)
+// Server'ı başlat
+app.listen(PORT, () => {
+  console.log(`PayTR Callback Server running on port ${PORT}`)
 })
