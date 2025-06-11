@@ -1,15 +1,21 @@
 {
-  "name": "paytr-callback-server",
+  "name": "paytr-callback-proxy",
   "version": "1.0.0",
-  "description": "PayTR callback server",
-  "main": "server.js",
+  "description": "PayTR callback proxy for Vercel apps",
+  "main": "index.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node index.js",
+    "dev": "nodemon index.js"
   },
   "dependencies": {
-    "express": "^4.18.2"
+    "express": "^4.18.2",
+    "node-fetch": "^2.6.7",
+    "crypto": "^1.0.1"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": "18.x"
+    "node": ">=14.0.0"
   }
 }
