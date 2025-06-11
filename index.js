@@ -19,7 +19,7 @@ app.get("/", (req, res) => {
     status: "OK",
     message: "PayTR Callback Server is running",
     timestamp: new Date().toISOString(),
-    version: "8.0.0",
+    version: "9.0.0",
   })
 })
 
@@ -40,6 +40,8 @@ app.get("/health", (req, res) => {
 
 // Global değişken - son başarılı ödeme bilgilerini sakla (5 dakika boyunca)
 const lastSuccessfulPayments = new Map()
+// Devam eden ödemeleri izle
+const ongoingPayments = new Set()
 
 // PayTR callback endpoint - POST
 app.post("/paytr-callback", async (req, res) => {
@@ -50,13 +52,19 @@ app.post("/paytr-callback", async (req, res) => {
 
   try {
     // PayTR'den gelen veriler
-    const { merchant_oid, status, total_amount, hash } = req.body
+    const { merchant_oid, status, total_amount, hash, fail_message } = req.body
+
+    // Fail message varsa logla
+    if (fail_message) {
+      console.log("⚠️ PayTR fail message:", fail_message)
+    }
 
     console.log("Extracted values:", {
       merchant_oid,
       status,
       total_amount,
       hash: hash ? hash.substring(0, 10) + "..." : "missing",
+      fail_message,
     })
 
     if (!merchant_oid || !status || total_amount === undefined || !hash) {
@@ -120,6 +128,12 @@ app.post("/paytr-callback", async (req, res) => {
       }
       lastSuccessfulPayments.set(merchant_oid, paymentData)
       console.log("💾 Saved last successful payment:", paymentData)
+
+      // Devam eden ödemelerden kaldır
+      if (ongoingPayments.has(merchant_oid)) {
+        ongoingPayments.delete(merchant_oid)
+        console.log("🗑️ Removed from ongoing payments:", merchant_oid)
+      }
     }
 
     // Ana uygulamaya bildirim gönder
@@ -153,6 +167,12 @@ app.post("/paytr-callback", async (req, res) => {
         }
       } else {
         console.log(`❌ Payment FAILED for order: ${merchant_oid}`)
+
+        // Devam eden ödemelerden kaldır
+        if (ongoingPayments.has(merchant_oid)) {
+          ongoingPayments.delete(merchant_oid)
+          console.log("🗑️ Removed from ongoing payments:", merchant_oid)
+        }
       }
 
       // PayTR'ye OK yanıtı döndür
@@ -214,10 +234,15 @@ app.get("/paytr-callback", (req, res) => {
   }
 
   // Normal query parametreleri varsa onları kullan
-  if (status === "success" || merchant_oid) {
+  if (status === "success" && merchant_oid) {
     const amount_tl = total_amount ? Math.round(Number.parseInt(total_amount) / 100) : 0
     const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${merchant_oid || "UNKNOWN"}&amount=${amount_tl}`
     console.log(`✅ Redirecting to success: ${redirectUrl}`)
+    res.redirect(redirectUrl)
+  } else if (merchant_oid) {
+    // Başarısız ama sipariş numarası var
+    const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=${merchant_oid}&status=${status || "failed"}`
+    console.log(`❌ Redirecting to fail with order: ${redirectUrl}`)
     res.redirect(redirectUrl)
   } else {
     // Hiçbir bilgi yoksa başarısız sayfaya yönlendir
@@ -225,6 +250,33 @@ app.get("/paytr-callback", (req, res) => {
     console.log(`❌ Redirecting to fail: ${redirectUrl}`)
     res.redirect(redirectUrl)
   }
+})
+
+// Ödeme başlatma kaydı
+app.post("/register-payment", (req, res) => {
+  const { merchant_oid } = req.body
+
+  if (!merchant_oid) {
+    return res.status(400).json({ success: false, message: "merchant_oid required" })
+  }
+
+  if (ongoingPayments.has(merchant_oid)) {
+    return res.status(409).json({
+      success: false,
+      message: "Payment already in progress",
+      ongoing: true,
+    })
+  }
+
+  ongoingPayments.add(merchant_oid)
+  console.log("➕ Added to ongoing payments:", merchant_oid)
+  console.log("📊 Current ongoing payments:", Array.from(ongoingPayments))
+
+  return res.json({
+    success: true,
+    message: "Payment registered",
+    ongoing: false,
+  })
 })
 
 // Debug endpoint
@@ -246,6 +298,7 @@ app.all("/debug", (req, res) => {
     headers: req.headers,
     timestamp: new Date().toISOString(),
     lastSuccessfulPayment: Array.from(lastSuccessfulPayments.entries()),
+    ongoingPayments: Array.from(ongoingPayments),
     env: {
       PORT: process.env.PORT,
       BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
@@ -270,25 +323,6 @@ app.get("/test-fail", (req, res) => {
   res.redirect(`${baseUrl}/odeme/basarisiz?siparis=TEST123&status=failed`)
 })
 
-// PayTR'nin doğrudan yönlendirme yapacağı endpoint
-app.get("/direct-callback", (req, res) => {
-  console.log("=== DIRECT CALLBACK RECEIVED ===")
-  console.log("Query:", JSON.stringify(req.query, null, 2))
-
-  const { merchant_oid, status } = req.query
-  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
-
-  if (status === "success") {
-    const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${merchant_oid || "UNKNOWN"}`
-    console.log(`✅ Direct redirecting to success: ${redirectUrl}`)
-    res.redirect(redirectUrl)
-  } else {
-    const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=${merchant_oid || "UNKNOWN"}`
-    console.log(`❌ Direct redirecting to fail: ${redirectUrl}`)
-    res.redirect(redirectUrl)
-  }
-})
-
 // Server'ı başlat
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 PayTR Callback Server running on port ${PORT}`)
@@ -297,7 +331,6 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`💚 Health Check: https://paytr-callback-server-production.up.railway.app/health`)
   console.log(`🧪 Test Success: https://paytr-callback-server-production.up.railway.app/test-success`)
   console.log(`🧪 Test Fail: https://paytr-callback-server-production.up.railway.app/test-fail`)
-  console.log(`🔄 Direct Callback: https://paytr-callback-server-production.up.railway.app/direct-callback`)
 
   const merchant_key = process.env.PAYTR_MERCHANT_KEY
   let merchant_salt = process.env.PAYTR_MERCHANT_SALT
