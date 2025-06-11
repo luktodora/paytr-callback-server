@@ -1,8 +1,7 @@
-const express = require("express")
-const bodyParser = require("body-parser")
-const crypto = require("crypto")
-const fetch = require("node-fetch")
-const cors = require("cors")
+import express from "express"
+import crypto from "crypto"
+import cors from "cors"
+import fetch from "node-fetch"
 
 const app = express()
 const PORT = process.env.PORT || 3000
@@ -11,27 +10,48 @@ const PORT = process.env.PORT || 3000
 app.use(cors())
 
 // Body parser middleware
-app.use(bodyParser.urlencoded({ extended: true }))
-app.use(bodyParser.json())
+app.use(express.urlencoded({ extended: true }))
+app.use(express.json())
 
 // Ana sayfa
 app.get("/", (req, res) => {
-  res.send("PayTR Callback Server is running")
+  res.json({
+    status: "OK",
+    message: "PayTR Callback Server is running",
+    timestamp: new Date().toISOString(),
+    version: "2.0.0",
+  })
 })
 
-// PayTR callback endpoint
+// Health check endpoint
+app.get("/health", (req, res) => {
+  res.json({
+    status: "healthy",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+  })
+})
+
+// PayTR callback endpoint - POST
 app.post("/paytr-callback", async (req, res) => {
-  console.log("=== PAYTR CALLBACK RECEIVED ===")
+  console.log("=== PAYTR CALLBACK POST RECEIVED ===")
   console.log("Timestamp:", new Date().toISOString())
-  console.log("Headers:", req.headers)
-  console.log("Body:", req.body)
+  console.log("Headers:", JSON.stringify(req.headers, null, 2))
+  console.log("Body:", JSON.stringify(req.body, null, 2))
 
   try {
     // PayTR'den gelen veriler
     const { merchant_oid, status, total_amount, hash } = req.body
 
+    console.log("Extracted values:", {
+      merchant_oid,
+      status,
+      total_amount,
+      hash: hash ? "***" : "missing",
+    })
+
     if (!merchant_oid || !status || !total_amount || !hash) {
-      console.error("Missing required fields in callback")
+      console.error("❌ Missing required fields in callback")
       return res.status(400).send("MISSING_PARAMS")
     }
 
@@ -40,7 +60,7 @@ app.post("/paytr-callback", async (req, res) => {
     const merchant_salt = process.env.PAYTR_MERCHANT_SALT
 
     if (!merchant_key || !merchant_salt) {
-      console.error("PayTR credentials missing")
+      console.error("❌ PayTR credentials missing")
       return res.status(500).send("CONFIG_ERROR")
     }
 
@@ -48,8 +68,8 @@ app.post("/paytr-callback", async (req, res) => {
     const calculated_hash = crypto.createHmac("sha256", merchant_key).update(hash_str).digest("base64")
 
     console.log("Hash verification:", {
-      received_hash: hash,
-      calculated_hash,
+      received_hash: hash.substring(0, 10) + "...",
+      calculated_hash: calculated_hash.substring(0, 10) + "...",
       match: hash === calculated_hash,
     })
 
@@ -58,15 +78,16 @@ app.post("/paytr-callback", async (req, res) => {
       return res.status(400).send("HASH_MISMATCH")
     }
 
-    // Sipariş durumunu işle
-    if (status === "success") {
-      console.log(`✅ Payment SUCCESS for order: ${merchant_oid}`)
-      console.log(`💰 Amount: ${total_amount} kuruş`)
+    console.log("✅ Hash verification SUCCESS")
 
-      // Ana uygulamaya bildirim gönder
-      const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
+    // Ana uygulamaya bildirim gönder
+    const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
 
-      try {
+    try {
+      if (status === "success") {
+        console.log(`✅ Payment SUCCESS for order: ${merchant_oid}`)
+        console.log(`💰 Amount: ${total_amount} kuruş`)
+
         // Siparişi tamamla
         const completeOrderResponse = await fetch(`${baseUrl}/api/orders`, {
           method: "POST",
@@ -78,59 +99,84 @@ app.post("/paytr-callback", async (req, res) => {
             amount: Math.round(Number.parseInt(total_amount) / 100), // Kuruştan TL'ye çevir
             status: "completed",
             paymentMethod: "paytr",
+            processedAt: new Date().toISOString(),
           }),
         })
 
         if (completeOrderResponse.ok) {
           console.log("✅ Order completed successfully")
         } else {
-          console.error("❌ Failed to complete order")
+          const errorText = await completeOrderResponse.text()
+          console.error("❌ Failed to complete order:", errorText)
         }
-
-        // Kullanıcıyı başarılı sayfasına yönlendir
-        console.log(
-          `✅ Redirecting to success page: ${baseUrl}/odeme/basarili?siparis=${merchant_oid}&amount=${total_amount}`,
-        )
-
-        // PayTR'ye OK yanıtı döndür
-        return res.send("OK")
-      } catch (error) {
-        console.error("Error processing order:", error)
-        return res.send("OK") // Yine de OK döndür
+      } else {
+        console.log(`❌ Payment FAILED for order: ${merchant_oid}`)
       }
-    } else {
-      console.log(`❌ Payment FAILED for order: ${merchant_oid}`)
 
-      // Kullanıcıyı başarısız sayfasına yönlendir
-      const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
-      console.log(`❌ Redirecting to fail page: ${baseUrl}/odeme/basarisiz?siparis=${merchant_oid}&status=failed`)
-
-      // PayTR'ye OK yanıtı döndür
+      // PayTR'ye OK yanıtı döndür (her durumda)
+      console.log("✅ Sending OK response to PayTR")
+      return res.send("OK")
+    } catch (error) {
+      console.error("❌ Error processing order:", error)
+      // Hata durumunda bile OK döndür
       return res.send("OK")
     }
   } catch (error) {
-    console.error("Callback error:", error)
+    console.error("❌ Callback error:", error)
     // Hata durumunda bile OK döndür
     return res.send("OK")
   }
 })
 
-// GET istekleri için de aynı endpoint
+// PayTR callback endpoint - GET (kullanıcı yönlendirmesi için)
 app.get("/paytr-callback", (req, res) => {
-  console.log("=== PAYTR CALLBACK GET ===")
-  console.log("Query:", req.query)
+  console.log("=== PAYTR CALLBACK GET RECEIVED ===")
+  console.log("Query:", JSON.stringify(req.query, null, 2))
 
-  const { merchant_oid, status } = req.query
+  const { merchant_oid, status, total_amount } = req.query
   const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
 
+  console.log("GET callback values:", { merchant_oid, status, total_amount })
+
   if (status === "success") {
-    res.redirect(`${baseUrl}/odeme/basarili?siparis=${merchant_oid || "UNKNOWN"}`)
+    const amount_tl = total_amount ? Math.round(Number.parseInt(total_amount) / 100) : 0
+    const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${merchant_oid || "UNKNOWN"}&amount=${amount_tl}`
+    console.log(`✅ Redirecting to success: ${redirectUrl}`)
+    res.redirect(redirectUrl)
   } else {
-    res.redirect(`${baseUrl}/odeme/basarisiz?siparis=${merchant_oid || "UNKNOWN"}&status=${status || "failed"}`)
+    const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=${merchant_oid || "UNKNOWN"}&status=${status || "failed"}`
+    console.log(`❌ Redirecting to fail: ${redirectUrl}`)
+    res.redirect(redirectUrl)
   }
 })
 
+// Debug endpoint
+app.all("/debug", (req, res) => {
+  res.json({
+    method: req.method,
+    url: req.url,
+    query: req.query,
+    body: req.body,
+    headers: req.headers,
+    timestamp: new Date().toISOString(),
+    env: {
+      PORT: process.env.PORT,
+      BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
+      HAS_MERCHANT_KEY: !!process.env.PAYTR_MERCHANT_KEY,
+      HAS_MERCHANT_SALT: !!process.env.PAYTR_MERCHANT_SALT,
+    },
+  })
+})
+
 // Server'ı başlat
-app.listen(PORT, () => {
-  console.log(`PayTR Callback Server running on port ${PORT}`)
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 PayTR Callback Server running on port ${PORT}`)
+  console.log(`📍 Callback URL: https://paytr-callback-server-production.up.railway.app/paytr-callback`)
+  console.log(`🔍 Debug URL: https://paytr-callback-server-production.up.railway.app/debug`)
+  console.log(`💚 Health Check: https://paytr-callback-server-production.up.railway.app/health`)
+  console.log(`⚙️  Environment:`, {
+    BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
+    HAS_MERCHANT_KEY: !!process.env.PAYTR_MERCHANT_KEY,
+    HAS_MERCHANT_SALT: !!process.env.PAYTR_MERCHANT_SALT,
+  })
 })
