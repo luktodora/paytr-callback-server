@@ -1,13 +1,20 @@
 import express from "express"
 import crypto from "crypto"
-import cors from "cors"
 import fetch from "node-fetch"
 
 const app = express()
 const PORT = process.env.PORT || 3000
 
-// CORS ayarları
-app.use(cors())
+// Manuel CORS ayarları
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*")
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept")
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(200)
+  }
+  next()
+})
 
 // Body parser middleware
 app.use(express.urlencoded({ extended: true }))
@@ -19,7 +26,7 @@ app.get("/", (req, res) => {
     status: "OK",
     message: "PayTR Callback Server is running",
     timestamp: new Date().toISOString(),
-    version: "2.0.0",
+    version: "3.0.0",
   })
 })
 
@@ -55,7 +62,7 @@ app.post("/paytr-callback", async (req, res) => {
       return res.status(400).send("MISSING_PARAMS")
     }
 
-    // Hash doğrulama
+    // Hash doğrulama - PayTR callback için doğru algoritma
     const merchant_key = process.env.PAYTR_MERCHANT_KEY
     const merchant_salt = process.env.PAYTR_MERCHANT_SALT
 
@@ -64,10 +71,16 @@ app.post("/paytr-callback", async (req, res) => {
       return res.status(500).send("CONFIG_ERROR")
     }
 
+    // PayTR callback hash algoritması: merchant_oid + merchant_salt + status + total_amount
     const hash_str = `${merchant_oid}${merchant_salt}${status}${total_amount}`
     const calculated_hash = crypto.createHmac("sha256", merchant_key).update(hash_str).digest("base64")
 
     console.log("Hash verification:", {
+      merchant_oid,
+      merchant_salt: merchant_salt.substring(0, 5) + "***",
+      status,
+      total_amount,
+      hash_str,
       received_hash: hash.substring(0, 10) + "...",
       calculated_hash: calculated_hash.substring(0, 10) + "...",
       match: hash === calculated_hash,
@@ -75,6 +88,9 @@ app.post("/paytr-callback", async (req, res) => {
 
     if (hash !== calculated_hash) {
       console.error("❌ Hash verification FAILED")
+      console.error("Expected hash:", calculated_hash)
+      console.error("Received hash:", hash)
+      console.error("Hash string:", hash_str)
       return res.status(400).send("HASH_MISMATCH")
     }
 
@@ -168,12 +184,49 @@ app.all("/debug", (req, res) => {
   })
 })
 
+// Test hash endpoint
+app.post("/test-hash", (req, res) => {
+  const { merchant_oid, status, total_amount, hash } = req.body
+  const merchant_key = process.env.PAYTR_MERCHANT_KEY
+  const merchant_salt = process.env.PAYTR_MERCHANT_SALT
+
+  if (!merchant_key || !merchant_salt) {
+    return res.json({ error: "Missing credentials" })
+  }
+
+  const hash_str = `${merchant_oid}${merchant_salt}${status}${total_amount}`
+  const calculated_hash = crypto.createHmac("sha256", merchant_key).update(hash_str).digest("base64")
+
+  res.json({
+    hash_str,
+    calculated_hash,
+    received_hash: hash,
+    match: hash === calculated_hash,
+  })
+})
+
+// Test endpoints
+app.get("/test-success", (req, res) => {
+  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
+  console.log("🧪 TEST SUCCESS")
+  res.redirect(`${baseUrl}/odeme/basarili?siparis=TEST123&amount=299&status=success`)
+})
+
+app.get("/test-fail", (req, res) => {
+  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
+  console.log("🧪 TEST FAIL")
+  res.redirect(`${baseUrl}/odeme/basarisiz?siparis=TEST123&status=failed`)
+})
+
 // Server'ı başlat
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 PayTR Callback Server running on port ${PORT}`)
   console.log(`📍 Callback URL: https://paytr-callback-server-production.up.railway.app/paytr-callback`)
   console.log(`🔍 Debug URL: https://paytr-callback-server-production.up.railway.app/debug`)
   console.log(`💚 Health Check: https://paytr-callback-server-production.up.railway.app/health`)
+  console.log(`🧪 Test Success: https://paytr-callback-server-production.up.railway.app/test-success`)
+  console.log(`🧪 Test Fail: https://paytr-callback-server-production.up.railway.app/test-fail`)
+  console.log(`🔐 Test Hash: https://paytr-callback-server-production.up.railway.app/test-hash`)
   console.log(`⚙️  Environment:`, {
     BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
     HAS_MERCHANT_KEY: !!process.env.PAYTR_MERCHANT_KEY,
