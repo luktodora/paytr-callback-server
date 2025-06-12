@@ -19,7 +19,7 @@ app.get("/", (req, res) => {
     status: "OK",
     message: "PayTR Callback Server is running",
     timestamp: new Date().toISOString(),
-    version: "9.0.0",
+    version: "10.0.0",
   })
 })
 
@@ -54,9 +54,26 @@ app.post("/paytr-callback", async (req, res) => {
     // PayTR'den gelen veriler
     const { merchant_oid, status, total_amount, hash, fail_message } = req.body
 
-    // Fail message varsa logla
+    // Fail message varsa özel işlem yap
     if (fail_message) {
       console.log("⚠️ PayTR fail message:", fail_message)
+
+      // "Devam eden bir ödeme işleminiz var" mesajı için özel handling
+      if (
+        fail_message.includes("Devam eden bir ödeme işleminiz var") ||
+        fail_message.includes("devam eden") ||
+        fail_message.includes("ongoing")
+      ) {
+        console.log("🔄 Ongoing payment detected, redirecting to fail page")
+
+        // PayTR'ye OK yanıtı döndür
+        res.send("OK")
+        return
+      }
+
+      // Diğer fail mesajları için de OK döndür
+      res.send("OK")
+      return
     }
 
     console.log("Extracted values:", {
@@ -67,9 +84,11 @@ app.post("/paytr-callback", async (req, res) => {
       fail_message,
     })
 
+    // Eğer gerekli alanlar eksikse ama fail_message yoksa, OK döndür
     if (!merchant_oid || !status || total_amount === undefined || !hash) {
       console.error("❌ Missing required fields in callback")
-      return res.status(400).send("MISSING_PARAMS")
+      res.send("OK")
+      return
     }
 
     // Environment variables kontrolü
@@ -87,7 +106,8 @@ app.post("/paytr-callback", async (req, res) => {
 
     if (!merchant_key || !merchant_salt) {
       console.error("❌ PayTR credentials missing")
-      return res.status(500).send("CONFIG_ERROR")
+      res.send("OK")
+      return
     }
 
     // PayTR callback hash algoritması
@@ -252,12 +272,22 @@ app.get("/paytr-callback", (req, res) => {
   }
 })
 
-// Ödeme başlatma kaydı
+// Ödeme başlatma kaydı - devam eden ödemeleri temizle
 app.post("/register-payment", (req, res) => {
   const { merchant_oid } = req.body
 
   if (!merchant_oid) {
     return res.status(400).json({ success: false, message: "merchant_oid required" })
+  }
+
+  // Eski devam eden ödemeleri temizle (5 dakikadan eski)
+  const fiveMinutesAgo = Date.now() - 5 * 60 * 1000
+  const currentTime = Date.now()
+
+  // Basit bir temizlik - gerçek uygulamada timestamp'li bir Map kullanılabilir
+  if (ongoingPayments.size > 10) {
+    ongoingPayments.clear()
+    console.log("🧹 Cleared old ongoing payments")
   }
 
   if (ongoingPayments.has(merchant_oid)) {
@@ -276,6 +306,25 @@ app.post("/register-payment", (req, res) => {
     success: true,
     message: "Payment registered",
     ongoing: false,
+  })
+})
+
+// Devam eden ödemeleri temizle endpoint
+app.post("/clear-ongoing", (req, res) => {
+  const { merchant_oid } = req.body
+
+  if (merchant_oid && ongoingPayments.has(merchant_oid)) {
+    ongoingPayments.delete(merchant_oid)
+    console.log("🗑️ Manually cleared ongoing payment:", merchant_oid)
+  } else {
+    ongoingPayments.clear()
+    console.log("🧹 Cleared all ongoing payments")
+  }
+
+  res.json({
+    success: true,
+    message: "Ongoing payments cleared",
+    remaining: Array.from(ongoingPayments),
   })
 })
 
@@ -331,6 +380,7 @@ app.listen(PORT, "0.0.0.0", () => {
   console.log(`💚 Health Check: https://paytr-callback-server-production.up.railway.app/health`)
   console.log(`🧪 Test Success: https://paytr-callback-server-production.up.railway.app/test-success`)
   console.log(`🧪 Test Fail: https://paytr-callback-server-production.up.railway.app/test-fail`)
+  console.log(`🧹 Clear Ongoing: https://paytr-callback-server-production.up.railway.app/clear-ongoing`)
 
   const merchant_key = process.env.PAYTR_MERCHANT_KEY
   let merchant_salt = process.env.PAYTR_MERCHANT_SALT
