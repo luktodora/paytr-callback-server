@@ -19,7 +19,7 @@ app.get("/", (req, res) => {
     status: "OK",
     message: "PayTR Callback Server is running",
     timestamp: new Date().toISOString(),
-    version: "10.0.0",
+    version: "11.0.0", // Version updated
   })
 })
 
@@ -208,7 +208,7 @@ app.post("/paytr-callback", async (req, res) => {
   }
 })
 
-// PayTR callback endpoint - GET (kullanıcı yönlendirmesi için)
+// PayTR callback endpoint - GET (kullanıcı yönlendirmesi için) - GELİŞTİRİLMİŞ
 app.get("/paytr-callback", (req, res) => {
   console.log("=== PAYTR CALLBACK GET RECEIVED ===")
   console.log("Query:", JSON.stringify(req.query, null, 2))
@@ -221,11 +221,21 @@ app.get("/paytr-callback", (req, res) => {
 
   console.log("GET callback values:", { merchant_oid, status, total_amount })
 
-  // Eğer query parametreleri boşsa, son başarılı ödemeleri kontrol et
-  if (!merchant_oid && !status) {
-    console.log("🔍 Checking saved payments...")
+  // PayTR'den gelen referer kontrolü
+  const referer = req.headers.referer || req.headers.referrer
+  const isFromPayTR = referer && referer.includes("paytr.com")
 
-    // Süresi dolmuş ödemeleri temizle
+  console.log("Referer check:", {
+    referer,
+    isFromPayTR,
+    userAgent: req.headers["user-agent"],
+  })
+
+  // Eğer PayTR'den geliyorsa ve parametreler yoksa, özel handling
+  if (isFromPayTR && (!merchant_oid || !status)) {
+    console.log("🔍 PayTR redirect without parameters detected")
+
+    // Son başarılı ödemeleri kontrol et
     const now = Date.now()
     for (const [key, payment] of lastSuccessfulPayments.entries()) {
       if (payment.expiresAt < now) {
@@ -246,9 +256,14 @@ app.get("/paytr-callback", (req, res) => {
       console.log("🔄 Using latest successful payment data:", latestPayment)
 
       const amount_tl = Math.round(Number.parseInt(latestPayment.total_amount) / 100)
-      const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${latestPayment.merchant_oid}&amount=${amount_tl}`
+      const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${latestPayment.merchant_oid}&amount=${amount_tl}&source=paytr-redirect`
       console.log(`✅ Redirecting to success with saved data: ${redirectUrl}`)
 
+      return res.redirect(redirectUrl)
+    } else {
+      // Başarılı ödeme bulunamadı, genel başarısız sayfaya yönlendir
+      console.log("❌ No recent successful payment found, redirecting to fail")
+      const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=UNKNOWN&status=no-recent-payment&source=paytr-redirect`
       return res.redirect(redirectUrl)
     }
   }
@@ -256,17 +271,17 @@ app.get("/paytr-callback", (req, res) => {
   // Normal query parametreleri varsa onları kullan
   if (status === "success" && merchant_oid) {
     const amount_tl = total_amount ? Math.round(Number.parseInt(total_amount) / 100) : 0
-    const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${merchant_oid || "UNKNOWN"}&amount=${amount_tl}`
+    const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${merchant_oid || "UNKNOWN"}&amount=${amount_tl}&source=callback-params`
     console.log(`✅ Redirecting to success: ${redirectUrl}`)
     res.redirect(redirectUrl)
   } else if (merchant_oid) {
     // Başarısız ama sipariş numarası var
-    const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=${merchant_oid}&status=${status || "failed"}`
+    const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=${merchant_oid}&status=${status || "failed"}&source=callback-params`
     console.log(`❌ Redirecting to fail with order: ${redirectUrl}`)
     res.redirect(redirectUrl)
   } else {
     // Hiçbir bilgi yoksa başarısız sayfaya yönlendir
-    const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=UNKNOWN&status=failed`
+    const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=UNKNOWN&status=no-params&source=callback-empty`
     console.log(`❌ Redirecting to fail: ${redirectUrl}`)
     res.redirect(redirectUrl)
   }
