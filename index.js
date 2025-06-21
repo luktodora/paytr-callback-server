@@ -1,5 +1,4 @@
 import express from "express"
-import crypto from "crypto"
 import fetch from "node-fetch"
 import cors from "cors"
 
@@ -8,26 +7,6 @@ const PORT = process.env.PORT || 3000
 
 // CORS middleware
 app.use(cors())
-
-// Raw body capture middleware (POST callback debug için)
-app.use("/paytr-callback", (req, res, next) => {
-  if (req.method === "POST") {
-    let rawBody = ""
-    req.on("data", (chunk) => {
-      rawBody += chunk.toString()
-    })
-    req.on("end", () => {
-      req.rawBody = rawBody
-      console.log("=== RAW POST DATA RECEIVED ===")
-      console.log("Raw Body Length:", rawBody.length)
-      console.log("Raw Body:", rawBody)
-      console.log("Content-Type:", req.headers["content-type"])
-      next()
-    })
-  } else {
-    next()
-  }
-})
 
 // Body parser middleware
 app.use(express.urlencoded({ extended: true }))
@@ -39,7 +18,7 @@ app.get("/", (req, res) => {
     status: "OK",
     message: "PayTR Callback Server is running",
     timestamp: new Date().toISOString(),
-    version: "13.0.0", // Version updated for enhanced logging
+    version: "14.0.0", // Updated version
   })
 })
 
@@ -58,122 +37,23 @@ app.get("/health", (req, res) => {
   })
 })
 
-// Global değişken - ödeme bilgilerini sakla
-const paymentData = new Map() // merchant_oid -> payment info
-const pendingRedirects = new Map() // IP -> redirect info
-const allRequests = [] // Tüm istekleri logla
-
-// Tüm istekleri logla
-app.use((req, res, next) => {
-  const requestLog = {
-    timestamp: new Date().toISOString(),
-    method: req.method,
-    url: req.url,
-    headers: req.headers,
-    query: req.query,
-    body: req.body,
-    rawBody: req.rawBody,
-    ip: req.headers["x-forwarded-for"] || req.headers["x-real-ip"] || req.connection.remoteAddress,
-  }
-
-  allRequests.push(requestLog)
-
-  // Son 100 isteği sakla
-  if (allRequests.length > 100) {
-    allRequests.shift()
-  }
-
-  console.log(`=== ${req.method} ${req.url} ===`)
-  console.log("From IP:", requestLog.ip)
-  console.log("User-Agent:", req.headers["user-agent"])
-  console.log("Referer:", req.headers["referer"])
-
-  next()
-})
-
-// PayTR callback endpoint - POST (Server-to-Server)
+// PayTR callback endpoint - POST (Server-to-Server) - Hala POST callback'leri dinliyoruz
 app.post("/paytr-callback", async (req, res) => {
   console.log("=== PAYTR CALLBACK POST RECEIVED ===")
   console.log("Timestamp:", new Date().toISOString())
   console.log("Headers:", JSON.stringify(req.headers, null, 2))
   console.log("Body:", JSON.stringify(req.body, null, 2))
-  console.log("Raw Body:", req.rawBody)
 
   try {
-    // PayTR'den gelen veriler
     const { merchant_oid, status, total_amount, hash, fail_message } = req.body
 
-    console.log("POST Callback - Extracted values:", {
-      merchant_oid,
-      status,
-      total_amount,
-      hash: hash ? hash.substring(0, 10) + "..." : "missing",
-      fail_message,
-    })
-
-    // Ödeme bilgilerini kaydet (GET callback için)
     if (merchant_oid && status) {
-      const paymentInfo = {
-        merchant_oid,
-        status,
-        total_amount: total_amount || "0",
-        timestamp: new Date().toISOString(),
-        expiresAt: Date.now() + 10 * 60 * 1000, // 10 dakika
-        processed: false,
-      }
+      console.log(`📨 POST Callback received: ${merchant_oid} - ${status}`)
 
-      paymentData.set(merchant_oid, paymentInfo)
-      console.log("💾 Saved payment data for GET callback:", paymentInfo)
-    }
+      // Ana uygulamaya bildirim gönder
+      const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
 
-    // Fail message varsa özel işlem yap
-    if (fail_message) {
-      console.log("⚠️ PayTR fail message:", fail_message)
-      res.send("OK")
-      return
-    }
-
-    // Gerekli alanlar kontrolü
-    if (!merchant_oid || !status || total_amount === undefined) {
-      console.error("❌ Missing required fields in POST callback")
-      res.send("OK")
-      return
-    }
-
-    // Environment variables kontrolü
-    const merchant_key = process.env.PAYTR_MERCHANT_KEY
-    let merchant_salt = process.env.PAYTR_MERCHANT_SALT
-    if (merchant_salt && merchant_salt.startsWith("=")) {
-      merchant_salt = merchant_salt.substring(1)
-    }
-
-    if (!merchant_key || !merchant_salt) {
-      console.error("❌ PayTR credentials missing")
-      res.send("OK")
-      return
-    }
-
-    // Hash doğrulama (opsiyonel)
-    if (hash) {
-      const hash_str = `${merchant_oid}${merchant_salt}${status}${total_amount}`
-      const calculated_hash = crypto.createHmac("sha256", merchant_key).update(hash_str).digest("base64")
-
-      if (hash !== calculated_hash) {
-        console.error("❌ Hash verification FAILED")
-        console.log("⚠️ Continuing despite hash mismatch")
-      } else {
-        console.log("✅ Hash verification SUCCESS")
-      }
-    }
-
-    // Ana uygulamaya bildirim gönder
-    const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
-
-    try {
-      if (status === "success") {
-        console.log(`✅ Payment SUCCESS for order: ${merchant_oid}`)
-
-        // Siparişi tamamla
+      try {
         const completeOrderResponse = await fetch(`${baseUrl}/api/orders`, {
           method: "POST",
           headers: {
@@ -181,41 +61,32 @@ app.post("/paytr-callback", async (req, res) => {
           },
           body: JSON.stringify({
             orderNumber: merchant_oid,
-            amount: Math.round(Number.parseInt(total_amount) / 100),
-            status: "completed",
+            amount: total_amount ? Math.round(Number.parseInt(total_amount) / 100) : 0,
+            status: status === "success" ? "completed" : "failed",
             paymentMethod: "paytr",
             processedAt: new Date().toISOString(),
+            source: "post_callback",
           }),
         })
 
         if (completeOrderResponse.ok) {
-          console.log("✅ Order completed successfully")
-          // İşlendiğini işaretle
-          if (paymentData.has(merchant_oid)) {
-            paymentData.get(merchant_oid).processed = true
-          }
+          console.log("✅ Order updated via POST callback")
         } else {
-          const errorText = await completeOrderResponse.text()
-          console.error("❌ Failed to complete order:", errorText)
+          console.error("❌ Failed to update order via POST callback")
         }
-      } else {
-        console.log(`❌ Payment FAILED for order: ${merchant_oid}`)
+      } catch (error) {
+        console.error("❌ Error processing POST callback:", error)
       }
-
-      // PayTR'ye OK yanıtı döndür
-      console.log("✅ Sending OK response to PayTR")
-      return res.send("OK")
-    } catch (error) {
-      console.error("❌ Error processing order:", error)
-      return res.send("OK")
     }
+
+    res.send("OK")
   } catch (error) {
     console.error("❌ POST Callback error:", error)
-    return res.send("OK")
+    res.send("OK")
   }
 })
 
-// PayTR callback endpoint - GET (Browser Redirect)
+// PayTR callback endpoint - GET (Browser Redirect) - GELİŞTİRİLMİŞ
 app.get("/paytr-callback", async (req, res) => {
   console.log("=== PAYTR CALLBACK GET RECEIVED ===")
   console.log("Query:", JSON.stringify(req.query, null, 2))
@@ -223,9 +94,8 @@ app.get("/paytr-callback", async (req, res) => {
 
   const { merchant_oid, status, total_amount } = req.query
   const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
-  const clientIP = req.headers["x-forwarded-for"] || req.headers["x-real-ip"] || req.connection.remoteAddress
 
-  console.log("GET callback values:", { merchant_oid, status, total_amount, clientIP })
+  console.log("GET callback values:", { merchant_oid, status, total_amount })
 
   // PayTR'den gelen referer kontrolü
   const referer = req.headers.referer || req.headers.referrer
@@ -233,88 +103,108 @@ app.get("/paytr-callback", async (req, res) => {
 
   console.log("Referer check:", { referer, isFromPayTR })
 
-  // Süresi dolmuş ödeme bilgilerini temizle
-  const now = Date.now()
-  for (const [key, payment] of paymentData.entries()) {
-    if (payment.expiresAt < now) {
-      paymentData.delete(key)
-      console.log("🗑️ Removed expired payment:", key)
-    }
-  }
-
-  // Eğer query parametreleri varsa onları kullan
+  // Eğer query parametreleri varsa (URL'de gönderilmiş)
   if (merchant_oid && status) {
-    console.log("📋 Using query parameters")
+    console.log("📋 Using query parameters from URL")
+
+    // Ana uygulamaya bildirim gönder
+    try {
+      const completeOrderResponse = await fetch(`${baseUrl}/api/orders`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          orderNumber: merchant_oid,
+          amount: total_amount ? Math.round(Number.parseInt(total_amount) / 100) : 0,
+          status: status === "success" ? "completed" : "failed",
+          paymentMethod: "paytr",
+          processedAt: new Date().toISOString(),
+          source: "get_callback_with_params",
+        }),
+      })
+
+      if (completeOrderResponse.ok) {
+        console.log("✅ Order updated via GET callback with params")
+      }
+    } catch (error) {
+      console.error("❌ Error updating order via GET callback:", error)
+    }
 
     if (status === "success") {
       const amount_tl = total_amount ? Math.round(Number.parseInt(total_amount) / 100) : 0
-      const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${merchant_oid}&amount=${amount_tl}&source=query-params`
+      const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${merchant_oid}&amount=${amount_tl}&source=callback-params`
       console.log(`✅ Redirecting to success: ${redirectUrl}`)
       return res.redirect(redirectUrl)
     } else {
-      const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=${merchant_oid}&status=${status}&source=query-params`
+      const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=${merchant_oid}&status=${status}&source=callback-params`
       console.log(`❌ Redirecting to fail: ${redirectUrl}`)
       return res.redirect(redirectUrl)
     }
   }
 
-  // PayTR'den geliyorsa ve parametreler yoksa
+  // PayTR'den geliyorsa ama parametreler yoksa - veritabanından kontrol et
   if (isFromPayTR) {
-    console.log("🔍 PayTR redirect without parameters detected")
+    console.log("🔍 PayTR redirect without parameters - checking database")
 
-    // Bekleyen redirect bilgisini kaydet
-    const redirectInfo = {
-      timestamp: Date.now(),
-      ip: clientIP,
-      userAgent: req.headers["user-agent"],
-    }
-    pendingRedirects.set(clientIP, redirectInfo)
+    try {
+      // Son 10 dakikadaki pending siparişleri kontrol et
+      const checkOrderResponse = await fetch(`${baseUrl}/api/orders/check-recent`, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      })
 
-    // Kısa bir süre bekle (POST callback gelebilir)
-    console.log("⏳ Waiting for potential POST callback...")
+      if (checkOrderResponse.ok) {
+        const orderData = await checkOrderResponse.json()
 
-    await new Promise((resolve) => setTimeout(resolve, 3000)) // 3 saniye bekle
+        if (orderData.success && orderData.order) {
+          console.log("🔄 Found recent pending order:", orderData.order.orderNumber)
 
-    // Tekrar kontrol et
-    let foundPayment = null
+          // Siparişi başarılı olarak işaretle
+          const completeOrderResponse = await fetch(`${baseUrl}/api/orders`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              orderNumber: orderData.order.orderNumber,
+              amount: orderData.order.amount,
+              status: "completed",
+              paymentMethod: "paytr",
+              processedAt: new Date().toISOString(),
+              source: "get_callback_database_lookup",
+            }),
+          })
 
-    // Son 5 dakikadaki başarılı ödemeleri kontrol et
-    const fiveMinutesAgo = Date.now() - 5 * 60 * 1000
-    for (const [oid, payment] of paymentData.entries()) {
-      if (payment.status === "success" && new Date(payment.timestamp).getTime() > fiveMinutesAgo) {
-        if (!foundPayment || new Date(payment.timestamp) > new Date(foundPayment.timestamp)) {
-          foundPayment = payment
+          if (completeOrderResponse.ok) {
+            console.log("✅ Order completed via database lookup")
+
+            const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${orderData.order.orderNumber}&amount=${orderData.order.amount}&source=database-lookup`
+            console.log(`✅ Redirecting to success: ${redirectUrl}`)
+            return res.redirect(redirectUrl)
+          }
         }
       }
+    } catch (error) {
+      console.error("❌ Error checking database:", error)
     }
 
-    if (foundPayment) {
-      console.log("🔄 Using recent successful payment:", foundPayment)
-
-      const amount_tl = Math.round(Number.parseInt(foundPayment.total_amount) / 100)
-      const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${foundPayment.merchant_oid}&amount=${amount_tl}&source=recent-payment`
-      console.log(`✅ Redirecting to success: ${redirectUrl}`)
-
-      return res.redirect(redirectUrl)
-    } else {
-      // Başarılı ödeme bulunamadı
-      console.log("❌ No recent successful payment found")
-
-      // Genel bir başarısız sayfaya yönlendir ama daha az agresif
-      const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=PENDING&status=processing&source=no-recent-payment&info=Ödeme işleminiz kontrol ediliyor`
-      console.log(`⚠️ Redirecting to processing page: ${redirectUrl}`)
-
-      return res.redirect(redirectUrl)
-    }
+    // Veritabanından da bulunamadı
+    console.log("❌ No recent order found in database")
+    const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=PENDING&status=processing&source=no-database-match&info=Ödeme işleminiz kontrol ediliyor`
+    console.log(`⚠️ Redirecting to processing page: ${redirectUrl}`)
+    return res.redirect(redirectUrl)
   }
 
   // Varsayılan durum
-  console.log("❌ Unknown callback type, redirecting to fail")
+  console.log("❌ Unknown callback type")
   const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=UNKNOWN&status=unknown&source=default`
   return res.redirect(redirectUrl)
 })
 
-// Debug endpoint - tüm istekleri göster
+// Debug endpoint
 app.all("/debug", (req, res) => {
   res.json({
     method: req.method,
@@ -323,9 +213,6 @@ app.all("/debug", (req, res) => {
     body: req.body,
     headers: req.headers,
     timestamp: new Date().toISOString(),
-    paymentData: Array.from(paymentData.entries()),
-    pendingRedirects: Array.from(pendingRedirects.entries()),
-    allRequests: allRequests.slice(-20), // Son 20 istek
     env: {
       PORT: process.env.PORT,
       BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
@@ -335,34 +222,20 @@ app.all("/debug", (req, res) => {
   })
 })
 
-// Test POST callback endpoint
-app.post("/test-post-callback", (req, res) => {
-  console.log("=== TEST POST CALLBACK ===")
-  console.log("Headers:", JSON.stringify(req.headers, null, 2))
-  console.log("Body:", JSON.stringify(req.body, null, 2))
-  console.log("Raw Body:", req.rawBody)
-
-  res.send("OK")
-})
-
 // Test endpoints
 app.get("/test-success", (req, res) => {
   const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
-  console.log("🧪 TEST SUCCESS")
   res.redirect(`${baseUrl}/odeme/basarili?siparis=TEST123&amount=299&status=success`)
 })
 
 app.get("/test-fail", (req, res) => {
   const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
-  console.log("🧪 TEST FAIL")
   res.redirect(`${baseUrl}/odeme/basarisiz?siparis=TEST123&status=failed`)
 })
 
 // Server'ı başlat
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 PayTR Callback Server v13.0.0 running on port ${PORT}`)
+  console.log(`🚀 PayTR Callback Server v14.0.0 running on port ${PORT}`)
   console.log(`📍 Callback URL: https://paytr-callback-server-production.up.railway.app/paytr-callback`)
   console.log(`🔍 Debug URL: https://paytr-callback-server-production.up.railway.app/debug`)
-  console.log(`💚 Health Check: https://paytr-callback-server-production.up.railway.app/health`)
-  console.log(`🧪 Test POST: https://paytr-callback-server-production.up.railway.app/test-post-callback`)
 })
