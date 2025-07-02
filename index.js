@@ -1,241 +1,230 @@
-import express from "express"
-import fetch from "node-fetch"
-import cors from "cors"
+const express = require("express")
+const crypto = require("crypto")
+const { createClient } = require("@supabase/supabase-js")
 
 const app = express()
-const PORT = process.env.PORT || 3000
+const port = process.env.PORT || 3000
+
+// Middleware
+app.use(express.json())
+app.use(express.urlencoded({ extended: true }))
 
 // CORS middleware
-app.use(cors())
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*")
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization")
 
-// Body parser middleware
-app.use(express.urlencoded({ extended: true }))
-app.use(express.json())
-
-// Ana sayfa
-app.get("/", (req, res) => {
-  res.json({
-    status: "OK",
-    message: "PayTR Callback Server is running",
-    timestamp: new Date().toISOString(),
-    version: "14.0.0", // Updated version
-  })
+  if (req.method === "OPTIONS") {
+    res.sendStatus(200)
+  } else {
+    next()
+  }
 })
 
+// Supabase client
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
+
+// PayTR credentials
+const PAYTR_MERCHANT_ID = process.env.PAYTR_MERCHANT_ID
+const PAYTR_MERCHANT_KEY = process.env.PAYTR_MERCHANT_KEY
+const PAYTR_MERCHANT_SALT = process.env.PAYTR_MERCHANT_SALT
+const MAIN_SITE_URL = process.env.MAIN_SITE_URL || "https://mapsyorum.com.tr"
+
 // Health check endpoint
-app.get("/health", (req, res) => {
-  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
+app.get("/", (req, res) => {
   res.json({
-    status: "healthy",
+    status: "Railway PayTR Callback Server Running",
     timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    baseUrl: baseUrl,
-    env: {
-      MERCHANT_KEY: process.env.PAYTR_MERCHANT_KEY ? "SET" : "MISSING",
-      MERCHANT_SALT: process.env.PAYTR_MERCHANT_SALT ? "SET" : "MISSING",
+    environment: {
+      port: port,
+      supabase_url: process.env.SUPABASE_URL ? "Set" : "Not Set",
+      paytr_merchant_id: PAYTR_MERCHANT_ID ? "Set" : "Not Set",
+      main_site_url: MAIN_SITE_URL,
     },
   })
 })
 
-// PayTR callback endpoint - POST (Server-to-Server) - Hala POST callback'leri dinliyoruz
-app.post("/paytr-callback", async (req, res) => {
-  console.log("=== PAYTR CALLBACK POST RECEIVED ===")
-  console.log("Timestamp:", new Date().toISOString())
-  console.log("Headers:", JSON.stringify(req.headers, null, 2))
-  console.log("Body:", JSON.stringify(req.body, null, 2))
-
+// PayTR callback endpoint
+app.post("/", async (req, res) => {
   try {
-    const { merchant_oid, status, total_amount, hash, fail_message } = req.body
+    console.log("🔔 PayTR Callback received:", req.body)
+    console.log("📋 Headers:", req.headers)
 
-    if (merchant_oid && status) {
-      console.log(`📨 POST Callback received: ${merchant_oid} - ${status}`)
+    const {
+      merchant_oid,
+      status,
+      total_amount,
+      hash,
+      failed_reason_code,
+      failed_reason_msg,
+      test_mode,
+      payment_type,
+      currency,
+      payment_amount,
+    } = req.body
 
-      // Ana uygulamaya bildirim gönder
-      const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
+    // Log the callback
+    await supabase.from("payment_logs").insert({
+      order_id: null,
+      event: "paytr_callback_received",
+      data: {
+        merchant_oid,
+        status,
+        total_amount,
+        hash,
+        failed_reason_code,
+        failed_reason_msg,
+        test_mode,
+        payment_type,
+        currency,
+        payment_amount,
+        timestamp: new Date().toISOString(),
+        source: "railway_server",
+      },
+    })
 
-      try {
-        const completeOrderResponse = await fetch(`${baseUrl}/api/orders`, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-            orderNumber: merchant_oid,
-            amount: total_amount ? Math.round(Number.parseInt(total_amount) / 100) : 0,
-            status: status === "success" ? "completed" : "failed",
-            paymentMethod: "paytr",
-            processedAt: new Date().toISOString(),
-            source: "post_callback",
-          }),
-        })
+    // Verify hash
+    const hashStr = `${merchant_oid}${PAYTR_MERCHANT_SALT}${status}${total_amount}`
+    const calculatedHash = crypto.createHmac("sha256", PAYTR_MERCHANT_KEY).update(hashStr).digest("base64")
 
-        if (completeOrderResponse.ok) {
-          console.log("✅ Order updated via POST callback")
-        } else {
-          console.error("❌ Failed to update order via POST callback")
-        }
-      } catch (error) {
-        console.error("❌ Error processing POST callback:", error)
-      }
+    console.log("🔐 Hash verification:", {
+      received: hash,
+      calculated: calculatedHash,
+      match: hash === calculatedHash,
+    })
+
+    if (hash !== calculatedHash) {
+      console.error("❌ Hash verification failed")
+      await supabase.from("payment_logs").insert({
+        order_id: null,
+        event: "hash_verification_failed",
+        data: { merchant_oid, received_hash: hash, calculated_hash: calculatedHash },
+      })
+      return res.status(400).send("Hash verification failed")
     }
 
-    res.send("OK")
-  } catch (error) {
-    console.error("❌ POST Callback error:", error)
-    res.send("OK")
-  }
-})
+    // Find the order
+    const { data: order, error: orderError } = await supabase
+      .from("orders")
+      .select("*")
+      .eq("order_number", merchant_oid)
+      .single()
 
-// PayTR callback endpoint - GET (Browser Redirect) - GELİŞTİRİLMİŞ
-app.get("/paytr-callback", async (req, res) => {
-  console.log("=== PAYTR CALLBACK GET RECEIVED ===")
-  console.log("Query:", JSON.stringify(req.query, null, 2))
-  console.log("Headers:", JSON.stringify(req.headers, null, 2))
+    if (orderError || !order) {
+      console.error("❌ Order not found:", merchant_oid)
+      await supabase.from("payment_logs").insert({
+        order_id: null,
+        event: "order_not_found",
+        data: { merchant_oid, error: orderError },
+      })
+      return res.status(404).send("Order not found")
+    }
 
-  const { merchant_oid, status, total_amount } = req.query
-  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
+    console.log("✅ Order found:", order.id)
 
-  console.log("GET callback values:", { merchant_oid, status, total_amount })
+    // Update order status based on payment result
+    let newStatus
+    let completedAt = null
 
-  // PayTR'den gelen referer kontrolü
-  const referer = req.headers.referer || req.headers.referrer
-  const isFromPayTR = referer && referer.includes("paytr.com")
+    if (status === "success") {
+      newStatus = "completed"
+      completedAt = new Date().toISOString()
+      console.log("✅ Payment successful")
+    } else {
+      newStatus = "failed"
+      console.log("❌ Payment failed:", failed_reason_msg)
+    }
 
-  console.log("Referer check:", { referer, isFromPayTR })
+    // Update order in database
+    const { error: updateError } = await supabase
+      .from("orders")
+      .update({
+        status: newStatus,
+        payment_response: req.body,
+        completed_at: completedAt,
+        updated_at: new Date().toISOString(),
+      })
+      .eq("id", order.id)
 
-  // Eğer query parametreleri varsa (URL'de gönderilmiş)
-  if (merchant_oid && status) {
-    console.log("📋 Using query parameters from URL")
+    if (updateError) {
+      console.error("❌ Order update error:", updateError)
+      await supabase.from("payment_logs").insert({
+        order_id: order.id,
+        event: "order_update_failed",
+        data: { error: updateError, merchant_oid },
+      })
+      return res.status(500).send("Order update failed")
+    }
 
-    // Ana uygulamaya bildirim gönder
+    // Log the payment completion
+    await supabase.from("payment_logs").insert({
+      order_id: order.id,
+      event: status === "success" ? "payment_completed" : "payment_failed",
+      data: {
+        merchant_oid,
+        status,
+        total_amount,
+        failed_reason_code,
+        failed_reason_msg,
+        payment_type,
+        currency,
+        test_mode,
+      },
+    })
+
+    // Notify main site about payment status
     try {
-      const completeOrderResponse = await fetch(`${baseUrl}/api/orders`, {
+      const notificationResponse = await fetch(`${MAIN_SITE_URL}/api/payment/success-notification`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
           orderNumber: merchant_oid,
-          amount: total_amount ? Math.round(Number.parseInt(total_amount) / 100) : 0,
-          status: status === "success" ? "completed" : "failed",
-          paymentMethod: "paytr",
-          processedAt: new Date().toISOString(),
-          source: "get_callback_with_params",
+          status: newStatus,
+          paymentData: req.body,
         }),
       })
 
-      if (completeOrderResponse.ok) {
-        console.log("✅ Order updated via GET callback with params")
-      }
-    } catch (error) {
-      console.error("❌ Error updating order via GET callback:", error)
+      console.log("📤 Main site notification sent:", notificationResponse.status)
+    } catch (notifyError) {
+      console.error("❌ Main site notification failed:", notifyError)
+      // Don't fail the callback if notification fails
     }
 
-    if (status === "success") {
-      const amount_tl = total_amount ? Math.round(Number.parseInt(total_amount) / 100) : 0
-      const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${merchant_oid}&amount=${amount_tl}&source=callback-params`
-      console.log(`✅ Redirecting to success: ${redirectUrl}`)
-      return res.redirect(redirectUrl)
-    } else {
-      const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=${merchant_oid}&status=${status}&source=callback-params`
-      console.log(`❌ Redirecting to fail: ${redirectUrl}`)
-      return res.redirect(redirectUrl)
-    }
+    console.log("✅ Callback processed successfully")
+    res.send("OK")
+  } catch (error) {
+    console.error("❌ Callback processing error:", error)
+
+    // Log the error
+    await supabase.from("payment_logs").insert({
+      order_id: null,
+      event: "callback_processing_error",
+      data: {
+        error: error.message,
+        stack: error.stack,
+        body: req.body,
+      },
+    })
+
+    res.status(500).send("Internal server error")
   }
-
-  // PayTR'den geliyorsa ama parametreler yoksa - veritabanından kontrol et
-  if (isFromPayTR) {
-    console.log("🔍 PayTR redirect without parameters - checking database")
-
-    try {
-      // Son 10 dakikadaki pending siparişleri kontrol et
-      const checkOrderResponse = await fetch(`${baseUrl}/api/orders/check-recent`, {
-        method: "GET",
-        headers: {
-          "Content-Type": "application/json",
-        },
-      })
-
-      if (checkOrderResponse.ok) {
-        const orderData = await checkOrderResponse.json()
-
-        if (orderData.success && orderData.order) {
-          console.log("🔄 Found recent pending order:", orderData.order.orderNumber)
-
-          // Siparişi başarılı olarak işaretle
-          const completeOrderResponse = await fetch(`${baseUrl}/api/orders`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify({
-              orderNumber: orderData.order.orderNumber,
-              amount: orderData.order.amount,
-              status: "completed",
-              paymentMethod: "paytr",
-              processedAt: new Date().toISOString(),
-              source: "get_callback_database_lookup",
-            }),
-          })
-
-          if (completeOrderResponse.ok) {
-            console.log("✅ Order completed via database lookup")
-
-            const redirectUrl = `${baseUrl}/odeme/basarili?siparis=${orderData.order.orderNumber}&amount=${orderData.order.amount}&source=database-lookup`
-            console.log(`✅ Redirecting to success: ${redirectUrl}`)
-            return res.redirect(redirectUrl)
-          }
-        }
-      }
-    } catch (error) {
-      console.error("❌ Error checking database:", error)
-    }
-
-    // Veritabanından da bulunamadı
-    console.log("❌ No recent order found in database")
-    const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=PENDING&status=processing&source=no-database-match&info=Ödeme işleminiz kontrol ediliyor`
-    console.log(`⚠️ Redirecting to processing page: ${redirectUrl}`)
-    return res.redirect(redirectUrl)
-  }
-
-  // Varsayılan durum
-  console.log("❌ Unknown callback type")
-  const redirectUrl = `${baseUrl}/odeme/basarisiz?siparis=UNKNOWN&status=unknown&source=default`
-  return res.redirect(redirectUrl)
 })
 
-// Debug endpoint
-app.all("/debug", (req, res) => {
+// Test endpoint
+app.get("/test", (req, res) => {
   res.json({
-    method: req.method,
-    url: req.url,
-    query: req.query,
-    body: req.body,
-    headers: req.headers,
+    message: "Railway PayTR Callback Server Test",
     timestamp: new Date().toISOString(),
-    env: {
-      PORT: process.env.PORT,
-      BASE_URL: process.env.NEXT_PUBLIC_BASE_URL,
-      MERCHANT_KEY: process.env.PAYTR_MERCHANT_KEY ? "SET" : "MISSING",
-      MERCHANT_SALT: process.env.PAYTR_MERCHANT_SALT ? "SET" : "MISSING",
-    },
+    environment: process.env.NODE_ENV || "development",
   })
 })
 
-// Test endpoints
-app.get("/test-success", (req, res) => {
-  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
-  res.redirect(`${baseUrl}/odeme/basarili?siparis=TEST123&amount=299&status=success`)
-})
-
-app.get("/test-fail", (req, res) => {
-  const baseUrl = process.env.NEXT_PUBLIC_BASE_URL || "https://mapsyorum.com.tr"
-  res.redirect(`${baseUrl}/odeme/basarisiz?siparis=TEST123&status=failed`)
-})
-
-// Server'ı başlat
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 PayTR Callback Server v14.0.0 running on port ${PORT}`)
-  console.log(`📍 Callback URL: https://paytr-callback-server-production.up.railway.app/paytr-callback`)
-  console.log(`🔍 Debug URL: https://paytr-callback-server-production.up.railway.app/debug`)
+// Start server
+app.listen(port, () => {
+  console.log(`🚀 Railway PayTR Callback Server running on port ${port}`)
+  console.log(`📡 Callback URL: https://paytr-callback-server-production.up.railway.app/`)
+  console.log(`🔗 Main Site: ${MAIN_SITE_URL}`)
 })
