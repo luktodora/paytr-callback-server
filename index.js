@@ -1,5 +1,4 @@
 const express = require("express")
-const cors = require("cors")
 const crypto = require("crypto")
 const { createClient } = require("@supabase/supabase-js")
 
@@ -7,31 +6,45 @@ const app = express()
 const PORT = process.env.PORT || 3001
 
 // Middleware
-app.use(cors())
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
 
-// Supabase client
-const supabaseUrl = process.env.SUPABASE_URL
-const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+// CORS middleware
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*")
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+  res.header("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization")
 
-if (!supabaseUrl || !supabaseServiceKey) {
-  console.error("❌ Missing Supabase environment variables")
+  if (req.method === "OPTIONS") {
+    res.sendStatus(200)
+  } else {
+    next()
+  }
+})
+
+// Environment variables check
+const requiredEnvVars = [
+  "SUPABASE_URL",
+  "SUPABASE_SERVICE_ROLE_KEY",
+  "PAYTR_MERCHANT_ID",
+  "PAYTR_MERCHANT_KEY",
+  "PAYTR_MERCHANT_SALT",
+]
+
+console.log("🔍 Checking environment variables...")
+const missingVars = requiredEnvVars.filter((varName) => !process.env[varName])
+
+if (missingVars.length > 0) {
+  console.error("❌ Missing environment variables:", missingVars)
   process.exit(1)
 }
 
-const supabase = createClient(supabaseUrl, supabaseServiceKey)
+console.log("✅ All environment variables are set")
 
-// PayTR configuration
-const PAYTR_MERCHANT_ID = process.env.PAYTR_MERCHANT_ID
-const PAYTR_MERCHANT_KEY = process.env.PAYTR_MERCHANT_KEY
-const PAYTR_MERCHANT_SALT = process.env.PAYTR_MERCHANT_SALT
-const MAIN_SITE_URL = process.env.MAIN_SITE_URL || "https://mapsyorum.com.tr"
+// Initialize Supabase client
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY)
 
-if (!PAYTR_MERCHANT_ID || !PAYTR_MERCHANT_KEY || !PAYTR_MERCHANT_SALT) {
-  console.error("❌ Missing PayTR environment variables")
-  process.exit(1)
-}
+console.log("✅ Supabase client initialized")
 
 // Health check endpoint
 app.get("/health", (req, res) => {
@@ -39,12 +52,13 @@ app.get("/health", (req, res) => {
     status: "healthy",
     timestamp: new Date().toISOString(),
     environment: {
-      supabaseUrl: !!supabaseUrl,
-      supabaseServiceKey: !!supabaseServiceKey,
-      paytrMerchantId: !!PAYTR_MERCHANT_ID,
-      paytrMerchantKey: !!PAYTR_MERCHANT_KEY,
-      paytrMerchantSalt: !!PAYTR_MERCHANT_SALT,
-      mainSiteUrl: MAIN_SITE_URL,
+      hasSupabaseUrl: !!process.env.SUPABASE_URL,
+      hasSupabaseKey: !!process.env.SUPABASE_SERVICE_ROLE_KEY,
+      hasPaytrCredentials: !!(
+        process.env.PAYTR_MERCHANT_ID &&
+        process.env.PAYTR_MERCHANT_KEY &&
+        process.env.PAYTR_MERCHANT_SALT
+      ),
     },
   })
 })
@@ -52,18 +66,23 @@ app.get("/health", (req, res) => {
 // Debug endpoint
 app.get("/debug", (req, res) => {
   res.json({
-    message: "PayTR Callback Server is running",
+    message: "PayTR Callback Server",
     timestamp: new Date().toISOString(),
     environment: process.env.NODE_ENV || "development",
     port: PORT,
   })
 })
 
-// PayTR callback endpoint (POST)
+// PayTR callback endpoint
 app.post("/", async (req, res) => {
-  try {
-    console.log("📥 PayTR callback received:", req.body)
+  console.log("📥 PayTR callback received:", {
+    method: req.method,
+    headers: req.headers,
+    body: req.body,
+    timestamp: new Date().toISOString(),
+  })
 
+  try {
     const {
       merchant_oid,
       status,
@@ -78,99 +97,84 @@ app.post("/", async (req, res) => {
     } = req.body
 
     // Verify hash
-    const hashStr = `${merchant_oid}${PAYTR_MERCHANT_SALT}${status}${total_amount}`
-    const calculatedHash = crypto.createHmac("sha256", PAYTR_MERCHANT_KEY).update(hashStr).digest("base64")
+    const hashString = `${merchant_oid}${process.env.PAYTR_MERCHANT_SALT}${status}${total_amount}`
+    const calculatedHash = crypto
+      .createHmac("sha256", process.env.PAYTR_MERCHANT_KEY)
+      .update(hashString)
+      .digest("base64")
+
+    console.log("🔐 Hash verification:", {
+      received: hash,
+      calculated: calculatedHash,
+      match: hash === calculatedHash,
+    })
 
     if (hash !== calculatedHash) {
       console.error("❌ Hash verification failed")
       return res.status(400).send("Hash verification failed")
     }
 
-    console.log("✅ Hash verified successfully")
-
-    // Find order by order number
-    const { data: order, error: orderError } = await supabase
-      .from("orders")
-      .select("*")
-      .eq("order_number", merchant_oid)
-      .single()
-
-    if (orderError || !order) {
-      console.error("❌ Order not found:", merchant_oid)
-      return res.status(404).send("Order not found")
-    }
-
-    console.log("✅ Order found:", order.id)
-
-    // Update order status based on payment status
-    let orderStatus = "pending"
-    let paymentStatus = "pending"
-
-    if (status === "success") {
-      orderStatus = "completed"
-      paymentStatus = "paid"
-      console.log("✅ Payment successful for order:", merchant_oid)
-    } else {
-      orderStatus = "failed"
-      paymentStatus = "failed"
-      console.log("❌ Payment failed for order:", merchant_oid)
-    }
-
-    // Update order
-    const { error: updateError } = await supabase
-      .from("orders")
-      .update({
-        status: orderStatus,
-        payment_status: paymentStatus,
-        updated_at: new Date().toISOString(),
-        completed_at: status === "success" ? new Date().toISOString() : null,
-      })
-      .eq("id", order.id)
-
-    if (updateError) {
-      console.error("❌ Order update error:", updateError)
-      return res.status(500).send("Order update failed")
-    }
-
-    // Log payment callback
-    await supabase.from("payment_logs").insert({
+    // Log to payment_logs table
+    const logData = {
       order_number: merchant_oid,
-      status,
-      amount: Number.parseInt(total_amount),
-      hash,
+      status: status,
+      amount: Number.parseFloat(total_amount),
+      hash: hash,
       failed_reason_code: failed_reason_code || null,
       failed_reason_msg: failed_reason_msg || null,
       test_mode: test_mode === "1",
       payment_type: payment_type || null,
       currency: currency || "TL",
-      payment_amount: payment_amount ? Number.parseInt(payment_amount) : null,
-      callback_data: req.body,
+      payment_amount: payment_amount ? Number.parseFloat(payment_amount) : null,
+      callback_data: JSON.stringify(req.body),
       created_at: new Date().toISOString(),
-    })
-
-    console.log("✅ Payment log created")
-
-    // Notify main site (optional)
-    try {
-      await fetch(`${MAIN_SITE_URL}/api/payment/success-notification`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          orderNumber: merchant_oid,
-          status: orderStatus,
-          paymentStatus: paymentStatus,
-          amount: total_amount,
-        }),
-      })
-      console.log("✅ Main site notified")
-    } catch (notifyError) {
-      console.error("⚠️ Failed to notify main site:", notifyError)
-      // Don't fail the callback if notification fails
     }
 
-    // Respond to PayTR
+    const { error: logError } = await supabase.from("payment_logs").insert([logData])
+
+    if (logError) {
+      console.error("❌ Failed to log payment:", logError)
+    } else {
+      console.log("✅ Payment logged successfully")
+    }
+
+    // Update order status
+    if (status === "success") {
+      // Payment successful
+      const { error: updateError } = await supabase
+        .from("orders")
+        .update({
+          status: "completed",
+          payment_status: "paid",
+          updated_at: new Date().toISOString(),
+          completed_at: new Date().toISOString(),
+        })
+        .eq("order_number", merchant_oid)
+
+      if (updateError) {
+        console.error("❌ Failed to update order:", updateError)
+      } else {
+        console.log("✅ Order updated successfully")
+      }
+    } else {
+      // Payment failed
+      const { error: updateError } = await supabase
+        .from("orders")
+        .update({
+          status: "failed",
+          payment_status: "failed",
+          updated_at: new Date().toISOString(),
+        })
+        .eq("order_number", merchant_oid)
+
+      if (updateError) {
+        console.error("❌ Failed to update failed order:", updateError)
+      } else {
+        console.log("✅ Failed order updated successfully")
+      }
+    }
+
+    // PayTR expects "OK" response
     res.send("OK")
     console.log("✅ Callback processed successfully")
   } catch (error) {
@@ -179,11 +183,24 @@ app.post("/", async (req, res) => {
   }
 })
 
-// PayTR callback endpoint (GET) - for testing
+// Handle GET requests to root
 app.get("/", (req, res) => {
   res.json({
-    message: "PayTR Callback Server",
-    status: "ready",
+    message: "PayTR Callback Server is running",
+    timestamp: new Date().toISOString(),
+    endpoints: {
+      callback: "POST /",
+      health: "GET /health",
+      debug: "GET /debug",
+    },
+  })
+})
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error("❌ Unhandled error:", error)
+  res.status(500).json({
+    error: "Internal server error",
     timestamp: new Date().toISOString(),
   })
 })
